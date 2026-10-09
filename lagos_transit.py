@@ -30,7 +30,7 @@ EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
 EMBEDDING_BASE_URL = "https://qwen-embed.publicaai.com/v1"
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
-CHROMA_PATH = "chroma_store"
+CHROMA_PATH = "lagos_transit_store"
 CHROMA_COLLECTION = "lagos_transit"
 SKLEARN_PATH = "lagos_transit_store/lagos_transit_index.json"
 
