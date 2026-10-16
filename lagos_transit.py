@@ -1,4 +1,3 @@
-
 """
 Lagos Transit Assistant: Streamlit front end for the RAG pipeline.
 
@@ -23,8 +22,8 @@ load_dotenv()
 # CONFIG (same values as your notebook)
 # ---------------------------------------------------------------
 CHAT_API_KEY = os.getenv("OPENAI_API_KEY")
-CHAT_BASE_URL = "https://api.groq.com/openai/v1"
-CHAT_MODEL = "openai/gpt-oss-20b"
+CHAT_BASE_URL = "https://museglimmer30b.publicaai.com/v1"
+CHAT_MODEL = "meta-models/Muse-Glimmer-30B" # try a larger Groq model if Yoruba/Igbo/Hausa quality is weak
 
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
 EMBEDDING_BASE_URL = "https://qwen-embed.publicaai.com/v1"
@@ -34,23 +33,53 @@ CHROMA_PATH = "lagos_transit_store"
 CHROMA_COLLECTION = "lagos_transit"
 SKLEARN_PATH = "lagos_transit_store/lagos_transit_index.json"
 
+# Sidebar label -> language name passed to the model (None = auto-detect)
+LANGUAGES = {
+    "Auto-detect": None,
+    "English": "English",
+    "Yorùbá": "Yoruba",
+    "Igbo": "Igbo",
+    "Hausa": "Hausa",
+}
+
 PROMPT = ChatPromptTemplate.from_template(
     """You are an expert AI Transit Consultant and Route Assistant for Lagos State, Nigeria.
-You will be provided with context containing factual commuter survey data, route costs, travel durations, peak traffic times, and transit challenges across all 20 Local Government Areas (LGAs) in Lagos.
+You have two sources of knowledge: (1) the commuter survey context below, and (2) your own general knowledge of Lagos geography, roads, transport modes and typical fares.
 
-Context:
+Survey Context:
 {context}
 
 User Question:
 {question}
 
+Reply language: {language}
+
 Instructions:
-1. Provide an accurate, clear, and actionable response based strictly on the provided transit context.
-2. If the user asks about fares, travel times, or route recommendations, extract precise numbers (in Nigerian Naira ₦) and estimates from the context.
-3. Keep the tone professional, concise, and helpful to a Lagos commuter or transit planner.
-4. If the context does not contain enough information to fully answer the question, state what is known from the context and gently advise the user to refine their query.
+1. Always give a direct, confident, actionable answer. Never leave the user without a number or recommendation when they ask about fares, travel time or routes.
+2. Use the survey context first. If it contains the exact route, quote those figures in Nigerian Naira (₦) and minutes/hours.
+3. If the context does NOT contain the exact route or detail, do NOT say so. Do not write phrases such as "the survey data does not contain", "no direct record", "not in the context" or "based on the closest available records". Instead, silently fall back on:
+   a. survey records for the nearest or most similar origin/destination (same corridor, neighbouring area, or similar distance), and
+   b. your own knowledge of Lagos transport (BRT, danfo, keke, okada, ride-hailing, ferry) and current typical fares.
+   Then give a single best estimate, ideally as a realistic range (e.g. ₦1,000–₦1,500), and name the likely modes and how fares differ between them.
+4. For travel times, adjust for peak hours (roughly 5:30-9:30am and 4-8pm) and give both a typical and a rush-hour estimate when relevant.
+5. Present estimates as normal guidance, not as a disclaimer. At most, end with one short, natural tip (for example, that fares can shift with fuel prices, traffic or time of day).
+6. Keep the tone professional, concise and helpful to a Lagos commuter or transit planner. Use short paragraphs or a few bullets; do not mention "context", "survey data" or "my training" unless the user asks where the figures come from.
+7. Write your entire answer in {language}. Keep numbers, ₦ amounts, place names and transport names (BRT, danfo, keke, okada) unchanged. Use correct tone marks and diacritics for Yoruba and Igbo. Use simple, everyday wording a commuter would use, not formal textbook wording. If {language} is English, reply in English.
 
 Answer:"""
+)
+
+TRANSLATE_PROMPT = ChatPromptTemplate.from_template(
+    """You are a translator for a Lagos transit assistant.
+Detect the language of the question (English, Yoruba, Igbo, Hausa, Nigerian Pidgin or other) and translate it into clear English.
+Keep place names (Ikorodu, Oshodi, Agege) and transport words (danfo, BRT, keke, okada) unchanged.
+If the question is already English, copy it as it is.
+
+Question: {question}
+
+Reply in exactly this format and nothing else:
+LANGUAGE: <language name>
+ENGLISH: <English translation>"""
 )
 
 SUGGESTIONS = [
@@ -184,7 +213,7 @@ def load_vector_store():
         )
 
     raise FileNotFoundError(
-        "No saved index found. Build it first (Chroma folder 'chroma_store' "
+        "No saved index found. Build it first (Chroma folder 'lagos_transit_store' "
         "or 'lagos_transit_store/lagos_transit_index.json')."
     )
 
@@ -198,6 +227,31 @@ def build_chain(temperature: float):
         streaming=True,
     )
     return PROMPT | llm | StrOutputParser()
+
+
+def prepare_query(question: str, chosen: str):
+    """Returns (reply_language, english_query). The English query is used for retrieval."""
+    lang, english = "English", question
+    try:
+        llm = ChatOpenAI(
+            model=CHAT_MODEL,
+            api_key=CHAT_API_KEY,
+            base_url=CHAT_BASE_URL,
+            temperature=0,
+        )
+        raw = (TRANSLATE_PROMPT | llm | StrOutputParser()).invoke({"question": question})
+        for line in raw.splitlines():
+            if line.upper().startswith("LANGUAGE:"):
+                lang = line.split(":", 1)[1].strip() or lang
+            elif line.upper().startswith("ENGLISH:"):
+                english = line.split(":", 1)[1].strip() or question
+    except Exception:
+        # If translation fails, fall back to searching with the original question.
+        pass
+
+    if LANGUAGES.get(chosen):  # user forced a language in the sidebar
+        lang = LANGUAGES[chosen]
+    return lang, english
 
 
 def retrieve(db, question: str, k: int):
@@ -246,7 +300,8 @@ with st.sidebar:
     st.markdown("### Lagos Transit Assistant")
     st.markdown(
         '<p class="side-note">Answers come from commuter survey data covering '
-        "fares, travel times and peak hours across Lagos State.</p>",
+        "fares, travel times and peak hours across Lagos State. "
+        "Ask in English, Yorùbá, Igbo or Hausa.</p>",
         unsafe_allow_html=True,
     )
     st.divider()
@@ -257,6 +312,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Settings**")
+    language_choice = st.selectbox("Language", list(LANGUAGES.keys()))
     k = st.slider("Passages to retrieve", 2, 10, 4)
     temperature = st.slider("Creativity", 0.0, 1.0, 0.1, 0.05)
     show_sources = st.toggle("Show sources", value=True)
@@ -309,12 +365,15 @@ if question:
         try:
             db = load_vector_store()
             with st.spinner("Checking the survey data..."):
-                docs = retrieve(db, question, k)
+                reply_lang, english_q = prepare_query(question, language_choice)
+                docs = retrieve(db, english_q, k)
             context = "\n\n".join(d.page_content for d in docs)
 
             chain = build_chain(temperature)
             answer = st.write_stream(
-                chain.stream({"context": context, "question": question})
+                chain.stream(
+                    {"context": context, "question": question, "language": reply_lang}
+                )
             )
             if show_sources:
                 render_sources(docs)
